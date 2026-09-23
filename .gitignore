@@ -1,0 +1,22 @@
+# secrets
+.env
+
+# local reference material (architecture/code screenshots) - never pushed
+reference-images/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# django
+db.sqlite3
+staticfiles/
+
+# app data
+attachments/
+
+# editor / os
+.vscode/
+.idea/
+Thumbs.db

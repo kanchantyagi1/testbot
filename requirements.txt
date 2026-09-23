@@ -1,0 +1,8 @@
+Django==5.2.7
+djangorestframework==3.16.1
+python-dotenv==1.0.1
+msal==1.39.0
+requests==2.32.3
+boto3==1.40.76
+APScheduler==3.11.3
+psycopg2-binary==2.9.13
