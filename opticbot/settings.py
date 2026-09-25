@@ -157,9 +157,21 @@ ALLOWED_EXTENSIONS = [
     for e in os.getenv("ALLOWED_EXTENSIONS", "pdf,docx,doc,xlsx,xls,csv,png,jpg,jpeg").split(",")
     if e.strip()
 ]
-MAX_ATTACHMENT_MB = float(os.getenv("MAX_ATTACHMENT_MB", "4.5"))
-MIN_ATTACHMENT_KB = float(os.getenv("MIN_ATTACHMENT_KB", "10"))
+# NO SIZE LIMITS ON ATTACHMENTS. An order file may be 2 KB or 50 MB - it
+# is downloaded, stored in S3 and processed either way. Size is never a
+# reason to skip an attachment: a 5.5 KB .xls and a 13.35 KB .pdf in the
+# sample data are both genuine orders, and a large scanned PDF is just as
+# real. Signature logos are excluded by the isInline check instead, and
+# anything that slips through is rejected by the prompt's is_order flag.
 SKIP_INLINE_ATTACHMENTS = env_bool("SKIP_INLINE_ATTACHMENTS", "True")
+
+# This is NOT a filter - nothing is skipped because of it. It is the
+# largest document the LLM provider will accept in one converse call
+# (Bedrock's documented per-document limit; verify for your model/region).
+# A file above it is still downloaded and stored, then the order is saved
+# as FAILED with an explicit message so a human can act on it, rather than
+# the attachment being dropped or a cryptic provider error surfacing.
+LLM_MAX_DOCUMENT_MB = float(os.getenv("LLM_MAX_DOCUMENT_MB", "4.5"))
 
 # ---------------------------------------------------------------------------
 # AWS
@@ -172,14 +184,36 @@ S3_INPUT_BUCKET = os.getenv("S3_INPUT_BUCKET", "")
 S3_OUTPUT_BUCKET = os.getenv("S3_OUTPUT_BUCKET", "")
 
 # ---------------------------------------------------------------------------
-# OE master lookup (pgvector RAG agent, built separately by the user)
+# OE master lookup - DIRECT pgvector query, same Postgres instance as
+# DATABASES['default'] above. No separate service, no URL - the backend
+# opens its own connection (django.db.connection, the one already
+# configured by DB_ENGINE/DB_HOST/etc.) and runs the cosine-similarity SQL
+# itself. See PLAN.md Appendix A for the exact table this expects and
+# services.py Section C for the query. Requires DB_ENGINE=postgres with
+# the pgvector extension; under DB_ENGINE=sqlite this degrades gracefully
+# (no pgvector support), same as OE_MATCHING_ENABLED=False.
 # ---------------------------------------------------------------------------
 
-OE_RAG_URL = os.getenv("OE_RAG_URL", "")
-OE_RAG_API_KEY = os.getenv("OE_RAG_API_KEY", "")
-OE_RAG_TIMEOUT = int(os.getenv("OE_RAG_TIMEOUT", "30"))
+OE_MATCHING_ENABLED = env_bool("OE_MATCHING_ENABLED", "True")
+# Must match the model/dimension used to populate oe_master.embedding, or
+# every score will be meaningless. Titan v2 1024-dim is the default -
+# change both together if you embed with something else.
+OE_EMBEDDING_MODEL_ID = os.getenv("OE_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0")
+OE_EMBEDDING_DIMENSION = int(os.getenv("OE_EMBEDDING_DIMENSION", "1024"))
 OE_MATCH_THRESHOLD = float(os.getenv("OE_MATCH_THRESHOLD", "0.82"))
 OE_TOP_K = int(os.getenv("OE_TOP_K", "5"))
+# When the top vector score doesn't clear OE_MATCH_THRESHOLD, ask an LLM to
+# reason over the candidates instead of going straight to human review.
+OE_RERANK_ENABLED = env_bool("OE_RERANK_ENABLED", "True")
+OE_RERANK_THRESHOLD = float(os.getenv("OE_RERANK_THRESHOLD", "0.75"))
+
+# ---------------------------------------------------------------------------
+# Email triage (order vs communication)
+# ---------------------------------------------------------------------------
+# Only skips an email when the classifier is CONFIDENT it is not an order.
+# Fails open - see services.classify_email().
+EMAIL_CLASSIFICATION_ENABLED = env_bool("EMAIL_CLASSIFICATION_ENABLED", "True")
+EMAIL_CLASSIFICATION_THRESHOLD = float(os.getenv("EMAIL_CLASSIFICATION_THRESHOLD", "0.80"))
 
 # ---------------------------------------------------------------------------
 # LLM
@@ -189,7 +223,7 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "bedrock").strip().lower()
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "global.anthropic.claude-opus-4-8")
 LLM_GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "")
 LLM_GATEWAY_API_KEY = os.getenv("LLM_GATEWAY_API_KEY", "")
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))  # verbose per-eye JSON schema needs headroom for multi-item orders
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
 
 # ---------------------------------------------------------------------------
@@ -206,11 +240,26 @@ REQUIRE_OE_MATCH = env_bool("REQUIRE_OE_MATCH", "True")
 RUN_SCHEDULER = env_bool("RUN_SCHEDULER", "False")
 
 # ---------------------------------------------------------------------------
-# Not used in phase 1 (seam reserved for the SQS worker, see PLAN.md §13)
+# SQS execution queue (PLAN.md §18)
 # ---------------------------------------------------------------------------
+# USE_SQS=False  -> the poller extracts inline, no queue involved.
+# USE_SQS=True   -> the poller puts the document in S3 and sends one
+#                   message per order; a worker job drains the queue.
+# Retries and the DLQ are configured ON THE QUEUE in AWS (redrive policy
+# with maxReceiveCount), not here - see services.py Section G.
 
 USE_SQS = env_bool("USE_SQS", "False")
 SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL", "")
+SQS_DLQ_URL = os.getenv("SQS_DLQ_URL", "")  # monitoring only; AWS does the redrive
+# Must comfortably exceed how long one extraction takes (LLM calls can run
+# 30-120s) or SQS will redeliver a message that is still being worked on.
+SQS_VISIBILITY_TIMEOUT = int(os.getenv("SQS_VISIBILITY_TIMEOUT", "300"))
+SQS_WAIT_TIME_SECONDS = int(os.getenv("SQS_WAIT_TIME_SECONDS", "20"))  # long polling
+SQS_MAX_MESSAGES = int(os.getenv("SQS_MAX_MESSAGES", "10"))  # per receive, AWS max is 10
+# Caps how many batches one worker tick drains, so a huge backlog cannot
+# make a single scheduled run last forever.
+SQS_MAX_BATCHES = int(os.getenv("SQS_MAX_BATCHES", "5"))
+SQS_WORKER_MINUTES = float(os.getenv("SQS_WORKER_MINUTES", "1"))
 
 # ---------------------------------------------------------------------------
 # Logging

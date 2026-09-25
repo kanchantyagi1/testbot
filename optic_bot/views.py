@@ -34,12 +34,16 @@ from rest_framework.response import Response
 from .models import Order
 from .services import (
     ConfigError,
+    aws_credentials_status,
+    collect_low_confidence_paths,
     export_order_to_csv,
     log_audit,
+    oe_master_status,
     poll_mailbox,
     presigned_url,
     reprocess_order,
     score,
+    set_by_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,6 +105,8 @@ def order_to_dict(order, include_fields=True, threshold=None):
         "oe_code": order.oe_code,
         "oe_confidence": order.oe_confidence,
         "oe_matched": order.oe_matched,
+        "oe_match_reason": order.oe_match_reason,
+        "oe_uom": order.oe_uom,
         "reviewed_by": order.reviewed_by,
         "reviewed_at": order.reviewed_at,
         "review_comment": order.review_comment,
@@ -116,11 +122,13 @@ def order_to_dict(order, include_fields=True, threshold=None):
         data["fields"] = fields
         data["oe_candidates"] = order.oe_candidates
         data["body_text"] = order.body_text
-        data["low_confidence_fields"] = [
-            name
-            for name, field in fields.items()
-            if isinstance(field, dict) and field.get("confidence", 0.0) < threshold
-        ]
+        # dotted paths into the nested extraction, e.g.
+        # "order.account_number", "line_items.0.right_eye.sphere" - the
+        # same paths PATCH /fields/ accepts
+        data["low_confidence_fields"] = list(
+            collect_low_confidence_paths(fields, threshold)
+        )
+        data["extraction_notes"] = fields.get("extraction_notes", "")
 
     return data
 
@@ -129,15 +137,24 @@ def _apply_field_edits(order, field_updates, actor):
     """Writes new values into order.extracted_data, marks each changed
     field confidence=1.0 and edited=True, recomputes min_confidence, and
     logs one AuditLog row per changed field. Does not save() the order -
-    callers save once after also handling oe_code / status."""
-    data = dict(order.extracted_data or {})
-    for field_name, new_value in field_updates.items():
-        old_field = data.get(field_name) or {}
-        old_value = old_field.get("value")
-        data[field_name] = {"value": new_value, "confidence": 1.0, "edited": True}
+    callers save once after also handling oe_code / status.
+
+    Keys are DOTTED PATHS into the nested extraction, exactly as returned
+    in low_confidence_fields, e.g.:
+        {"order.account_number": "6279505",
+         "line_items.0.right_eye.sphere": "-1.25"}
+    """
+    import copy
+
+    data = copy.deepcopy(order.extracted_data or {})
+    for path, new_value in field_updates.items():
+        try:
+            old_value = set_by_path(data, path, new_value)
+        except (KeyError, IndexError, ValueError, TypeError) as e:
+            raise ValueError(f"Cannot edit field '{path}': {e}")
         log_audit(
             order, "FIELD_EDITED", actor=actor,
-            field_name=field_name, old_value=old_value, new_value=new_value,
+            field_name=path, old_value=old_value, new_value=new_value,
         )
     order.extracted_data = data
     order.min_confidence = score(data)
@@ -179,14 +196,19 @@ def health(request):
     if settings.LLM_PROVIDER == "gateway":
         llm_status = dep_status(["LLM_GATEWAY_URL", "LLM_GATEWAY_API_KEY"])
     else:
-        llm_status = dep_status(["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"])
+        llm_status = "ok" if settings.BEDROCK_MODEL_ID else "not_configured: BEDROCK_MODEL_ID"
 
     return Response({
         "database": db_status,
+        # A REAL check, not a presence check - static keys are optional
+        # (services.aws_credential_kwargs()); this covers a CLI profile or
+        # an EC2 instance role too, not just AWS_ACCESS_KEY_ID in .env.
+        "aws_credentials": aws_credentials_status(),
         "outlook": dep_status(["MS_CLIENT_ID", "MS_CLIENT_SECRET", "MS_TENANT_ID", "MAILBOX_USER_EMAIL"]),
-        "s3": dep_status(["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "S3_INPUT_BUCKET"]),
+        "s3": dep_status(["S3_INPUT_BUCKET"]),
         "llm": llm_status,
-        "oe_rag": dep_status(["OE_RAG_URL"]),
+        "oe_master": oe_master_status(),
+        "sqs": (dep_status(["SQS_QUEUE_URL"]) if settings.USE_SQS else "disabled (inline mode)"),
         "confidence_threshold": settings.CONFIDENCE_THRESHOLD,
         "scheduler": "enabled" if settings.RUN_SCHEDULER else "disabled",
     })

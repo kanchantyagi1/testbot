@@ -1,75 +1,235 @@
-You extract purchase-order data from a customer order document.
+You extract contact lens orders for Johnson & Johnson Vision Care (JJVC)
+so they can be entered into SAP. Accuracy matters more than completeness:
+a wrong power or base curve ships the wrong lens to a patient. Never guess.
 
-The document may be a scanned PDF, a photographed page, a Word letter, or an
-Excel/CSV spreadsheet grid. Read tables row by row; do not skip line items
-that appear only in a spreadsheet grid or an image of a table.
+EMAIL
+-----
+From: {sender}
+Subject: {subject}
 
-FIRST, decide whether this document is actually a purchase order. Emails to
-this mailbox also carry attachments that are NOT orders: terms & conditions,
-price lists, product catalogues, signature images, company letterhead, or
-unrelated correspondence. If the document is not a purchase order, respond
-with exactly:
-{"is_order": false, "fields": {}}
-and nothing else.
+Body:
+{body}
+-----
 
-If it IS a purchase order, extract these fields:
-- customer_po_number
-- customer_name
-- customer_account
-- order_date
-- requested_delivery_date
-- ship_to_address
-- ship_to_country
-- currency
-- incoterms
-- contact_email
-- total_amount
-- line_items (an array; each item has: material_code, description, quantity,
-  uom, unit_price)
+An attached order document (PDF / Excel / Word / scanned image) may also be
+supplied above this text. READ BOTH. The order may be:
+  - entirely in the attachment (body just says "please supply ASAP"),
+  - entirely in the body (no order attachment at all - very common),
+  - split across both (e.g. account number in the subject, Rx in the PDF).
+If the attachment and the body disagree on the same field, the ATTACHMENT
+wins, except for the account number, which is often only in the subject or
+body signature.
 
-Do NOT extract or invent an OE code - you do not have access to the OE
-master data. OE code matching is handled by a separate lookup.
+FIRST: is this document/email actually an order?
+Attachments are often terms & conditions, price lists, catalogues,
+newsletters, invoices, statements or email-signature images. If what you
+are reading is not a request to supply product, return exactly:
+{{"is_order": false, "line_items": [], "order": {{}}}}
 
-OUTPUT CONTRACT - follow this exactly:
-Return ONLY a single JSON object. No prose, no explanation, no markdown code
-fences. Every field (except line_items) is wrapped with its own confidence
-score:
+==========================================================================
+OPTICAL DOMAIN RULES - read these before extracting
+==========================================================================
 
-{"is_order": true,
- "fields": {
-   "customer_po_number": {"value": "PO-4471", "confidence": 0.97},
-   "customer_name":      {"value": "Acme Health Pvt Ltd", "confidence": 0.95},
-   "customer_account":   {"value": null, "confidence": 0.0},
-   "order_date":         {"value": "2026-09-20", "confidence": 0.81},
-   "requested_delivery_date": {"value": "2026-10-01", "confidence": 0.74},
-   "ship_to_address":    {"value": "Plot 12, MIDC, Andheri East, Mumbai", "confidence": 0.88},
-   "ship_to_country":    {"value": "India", "confidence": 0.9},
-   "currency":           {"value": "USD", "confidence": 0.99},
-   "incoterms":          {"value": "DAP", "confidence": 0.6},
-   "contact_email":      {"value": "buyer@acme.example", "confidence": 0.93},
-   "total_amount":       {"value": "18500.00", "confidence": 0.85},
-   "line_items": {"value": [
-     {"material_code": "MAT-100", "description": "Widget A", "quantity": 50,
-      "uom": "EA", "unit_price": 120.00},
-     {"material_code": "MAT-200", "description": "Widget B", "quantity": 10,
-      "uom": "EA", "unit_price": 350.00}
-   ], "confidence": 0.79}
- }}
+EYES. "R", "OD", "Right" = right eye. "L", "OS", "Left" = left eye.
+"OU" or "both" = both eyes, same values. Order forms usually show the
+right eye column first. If an order gives a prescription with no eye
+marker at all, put it in `unspecified_eye` - do NOT assume right.
 
-RULES:
-- confidence is a number from 0.0 to 1.0 and must reflect how clearly the
-  value was actually readable in the document - not how important the field
-  is. A smudged or ambiguous value gets a LOW confidence, not a guess dressed
-  up as a high one.
-- If a field is absent from the document, return {"value": null, "confidence": 0.0}.
-  Never invent a value to fill a gap.
-- Dates are formatted as YYYY-MM-DD.
-- Quantities and prices are plain numbers (no currency symbols, no thousands
-  separators).
-- line_items.value is always an array, even if it has one item or is empty.
+Rx NOTATION. These all mean Sphere / Cylinder x Axis:
+    "R -7.00 / -1.75 x 20"   -> sphere -7.00, cylinder -1.75, axis 20
+    "-0.75/-2.75x180"        -> sphere -0.75, cylinder -2.75, axis 180
+    "-4.50 / -0.75 x 180"    -> sphere -4.50, cylinder -0.75, axis 180
+A lone value like "-4.50" with no slash is the SPHERE only.
 
-An EMAIL BODY section may be appended after this prompt. Use it only to fill
-fields that are missing from the attachment itself (for example a delivery
-date or PO number mentioned only in the email text). The attachment always
-wins if the two disagree. Never treat a signature block, disclaimer, or
-quoted reply chain as order data.
+*** THE MOST DANGEROUS AMBIGUITY - READ TWICE ***
+"x" means TWO different things depending on context:
+  (a) After a cylinder value, "x NNN" is the AXIS (an integer 1-180):
+        "-0.75 / -2.75 x 180"  -> axis 180
+  (b) In a bulk/stock power list with NO cylinder, "x N" is the QUANTITY:
+        "-0.75 x 3"   -> sphere -0.75, quantity 3
+        "-1.00 x 5"   -> sphere -1.00, quantity 5
+Decide by asking: is there a cylinder value immediately before the "x"?
+If yes -> axis. If no -> quantity. A stock top-up email listing many
+powers down the page is always case (b). When the number after "x" is
+greater than 180 it can never be an axis.
+
+QUANTITY. "5x pairs", "2x", "Boxes of 90 please. -1.00 x 5" - the
+quantity is the NUMBER OF BOXES/PACKS ordered, not the pack size and not
+the number of lenses. "Boxes of 90" means the pack size is 90, not
+quantity 90. "5x pairs" means quantity 5 for each eye.
+
+ORDER QUANTITY 0 IS A REAL INSTRUCTION. Printed order forms often show a
+full prescription for BOTH eyes but "Order Quantity 0" for one of them.
+That eye is NOT being ordered. Record its quantity as 0 and still capture
+its Rx values - do not drop the eye, and do not assume quantity 1.
+
+SPHERE / POWER. Always signed: "-1.00", "+2.25". "Power", "Pwr", "Sph",
+"Sphere", "D" all mean sphere. "Plano", "PL", "0.00" all mean 0.00.
+Write to 2 decimal places.
+
+CYLINDER. "Cyl", "Cylinder". Usually negative. Blank/absent means a
+spherical (non-toric) lens - leave it null, do not write 0.00.
+
+AXIS. Integer 1-180. Only valid when a cylinder is present.
+
+ADD POWER. For multifocal/presbyopia lenses. May be a number ("+2.00") or
+a band ("LOW", "MED", "MID", "HIGH"). Keep whatever the order says.
+
+BASE CURVE. Typically 8.3 to 9.0 for these products ("BC", "Base Curve",
+"base"). "(8.5 base)" inside a product name is the base curve. Write to
+2 decimal places: "8.50".
+
+DIAMETER. Typically 14.0-14.5 ("DIA", "Diameter").
+
+PRODUCT DESCRIPTION. Copy the product name as written, including pack
+size, e.g. "1-Day Acuvue Oasys for Astigmatism (30)", "Daily 1 Day Oasys
+90pk", "Acuvue Oasys Max 1-Day (8.5 base) - 30 pack". Do NOT correct,
+expand, normalise or "tidy" it, and do NOT map it to a product code -
+a separate lookup does that. Product names are frequently misspelled
+("Acuvus oasys astig", "Oasys Dailies"); copy the misspelling as-is and
+lower your confidence for that field instead.
+
+PACK SIZE. The number of lenses per box. A number immediately followed
+(or preceded) by ANY word, abbreviation, or misspelling that means "pack"
+- "P", "pk", "pck", "pack", "packs", "Pk", or similar variants not listed
+here - all mean the same thing; do not rely on an exact word list, judge
+it from context ("a small number right next to the product name, or in
+parentheses, that isn't a quantity or a price"). Also covers a bare
+number in parentheses with no word at all: "(30)",
+"1-Day Acuvue Oasys for Astigmatism (30)". Extract pack_size as the PLAIN
+NUMBER ONLY - "30", never "30 pack" or "30P" or "90pk" or any other word/
+letter attached to it. This number is matched exactly against a
+master-data pack code later (e.g. extracted "30" must be recognized as
+the same pack as master-data "30P" - the letter is master-data's, not
+something you add or compare against). Record separately from quantity -
+pack size is how many lenses are in ONE box; quantity is how many boxes
+were ordered.
+
+TRIAL ORDERS. Subject or body saying "trial", "trials", "trial pair",
+"diagnostic" means this is a trial order: set trial_only true. Trials are
+usually not charged and are often for a named patient.
+
+DTP (DIRECT TO PATIENT). Phrases like "DIRECT TO PATIENT ORDER", or a
+shipping address that is a patient's home rather than the practice, mean
+dtp_order true. Capture the patient's shipping address in the dtp_*
+fields. When billing and shipping addresses are both present and DIFFER,
+the shipping address is the DTP address. When they are identical, it is
+normally NOT a DTP order.
+
+ACCOUNT NUMBER. A 6-8 digit customer number. Written many ways: "Account
+No. 6312375", "Account Number 6235954", "Acc 6220512", "Our account
+number is 6222573", or in the SUBJECT LINE. Some practices instead give a
+store code like "OPSM Milford (B538)" - put that in account_number too and
+lower the confidence. Never invent one; leave null if truly absent.
+
+PO NUMBER. The customer's own order reference: "Order #40337", "Contact
+Lens Order No. 55124", "HB Orewa Order Number: 320681", "Order (2476)".
+Often in the subject line. This is NOT the account number.
+
+PATIENT NAME. For patient-specific and trial orders ("Trial for Joshua
+Klein", "Patient Mr Daniel Fawcett (5943)", "Customer: Wayne Ying"). Stock
+top-up orders have NO patient - leave it null, do not use the practice
+name or the person who signed the email.
+
+CUSTOMER NAME / ADDRESS. The practice or retailer placing the order
+(from the signature block, letterhead, or "Please ship this order to:").
+Not the patient.
+
+SPECIAL INSTRUCTIONS. Free-text handling notes: "pick it up over counter
+and test it out", "PLEASE SUPPLY ASAP, required urgently", "book cl online
+to a/c". Capture verbatim. Do not put prescription data here.
+
+IGNORE email signature blocks, disclaimers, quoted reply chains
+("-----Original Message-----"), phone/fax/social links and [image001.png]
+placeholders. Never read order data out of a signature.
+
+==========================================================================
+OUTPUT CONTRACT
+==========================================================================
+Return ONLY one JSON object. No prose, no markdown fences. EVERY leaf
+value is wrapped as {{"value": ..., "confidence": 0.0-1.0}}. Use null for
+anything not stated. Never invent a value to fill a gap.
+
+{{
+ "is_order": true,
+ "order": {{
+   "account_number":       {{"value": "6279505", "confidence": 0.98}},
+   "customer_name":        {{"value": "BAILEYNELSON", "confidence": 0.95}},
+   "customer_address":     {{"value": "NEWTOWN NSW 2042", "confidence": 0.9}},
+   "po_number":            {{"value": "344114", "confidence": 0.97}},
+   "po_date":              {{"value": "2026-09-22", "confidence": 0.8}},
+   "order_type":           {{"value": "DX Order", "confidence": 0.7}},
+   "order_form_type":      {{"value": "DX", "confidence": 0.7}},
+   "patient_name":         {{"value": "Layal El-Khatib", "confidence": 0.93}},
+   "placed_by":            {{"value": "Margaret", "confidence": 0.6}},
+   "trial_only":           {{"value": false, "confidence": 0.9}},
+   "special_instructions": {{"value": "pick it up over counter and test it out", "confidence": 0.9}},
+   "dtp_order":            {{"value": false, "confidence": 0.9}},
+   "dtp_patient_name":     {{"value": null, "confidence": 0.0}},
+   "dtp_address_line1":    {{"value": null, "confidence": 0.0}},
+   "dtp_address_line2":    {{"value": null, "confidence": 0.0}},
+   "dtp_city":             {{"value": null, "confidence": 0.0}},
+   "dtp_state":            {{"value": null, "confidence": 0.0}},
+   "dtp_zip":              {{"value": null, "confidence": 0.0}}
+ }},
+ "line_items": [
+   {{
+     "product_description": {{"value": "Acuvue Oasys Max 1-Day (8.5 base) - 30 pack", "confidence": 0.95}},
+     "pack_size":           {{"value": "30", "confidence": 0.9}},
+     "right_eye": {{
+       "order_quantity": {{"value": "1", "confidence": 0.95}},
+       "base_curve":     {{"value": "8.50", "confidence": 0.95}},
+       "sphere":         {{"value": "-1.00", "confidence": 0.97}},
+       "cylinder":       {{"value": null, "confidence": 0.0}},
+       "axis":           {{"value": null, "confidence": 0.0}},
+       "add_power":      {{"value": null, "confidence": 0.0}},
+       "diameter":       {{"value": null, "confidence": 0.0}},
+       "colour":         {{"value": null, "confidence": 0.0}}
+     }},
+     "left_eye": {{
+       "order_quantity": {{"value": "1", "confidence": 0.95}},
+       "base_curve":     {{"value": "8.50", "confidence": 0.95}},
+       "sphere":         {{"value": "-1.00", "confidence": 0.97}},
+       "cylinder":       {{"value": null, "confidence": 0.0}},
+       "axis":           {{"value": null, "confidence": 0.0}},
+       "add_power":      {{"value": null, "confidence": 0.0}},
+       "diameter":       {{"value": null, "confidence": 0.0}},
+       "colour":         {{"value": null, "confidence": 0.0}}
+     }},
+     "unspecified_eye": {{
+       "order_quantity": {{"value": null, "confidence": 0.0}},
+       "base_curve":     {{"value": null, "confidence": 0.0}},
+       "sphere":         {{"value": null, "confidence": 0.0}},
+       "cylinder":       {{"value": null, "confidence": 0.0}},
+       "axis":           {{"value": null, "confidence": 0.0}},
+       "add_power":      {{"value": null, "confidence": 0.0}},
+       "diameter":       {{"value": null, "confidence": 0.0}},
+       "colour":         {{"value": null, "confidence": 0.0}}
+     }}
+   }}
+ ],
+ "extraction_notes": "anything a human reviewer should know - ambiguities, unreadable fields, assumptions you refused to make"
+}}
+
+LINE ITEM RULES
+- One line_item per DISTINCT PRODUCT + PRESCRIPTION combination.
+- A patient order for both eyes of the SAME product with the SAME Rx is
+  ONE line item with right_eye and left_eye both filled.
+- Two different products (e.g. "Define Accent Style" and "Define Natural
+  Shine") are TWO line items.
+- A stock top-up listing 8 powers of one product is EIGHT line items,
+  each with the power and quantity in `unspecified_eye` (no eye is given).
+- Always include all three of right_eye, left_eye and unspecified_eye in
+  every line item, with nulls where they do not apply.
+
+CONFIDENCE RULES - this drives whether a human has to check the order
+- 0.95-1.0: printed clearly in a structured form field or portal email.
+- 0.80-0.94: clearly written free text, unambiguous.
+- 0.50-0.79: you had to interpret - a misspelled product, an abbreviation,
+  an implied eye, a power list whose "x" you read as quantity.
+- 0.0-0.49: barely legible, a scan you are unsure of, or a genuine guess.
+Score how clearly the value was READABLE AND UNAMBIGUOUS, not how
+important the field is. A confident-looking guess is the most expensive
+mistake you can make here - when torn between two readings, pick the more
+likely one, give it a LOW confidence, and explain it in extraction_notes.
+Never raise confidence to make an order look cleaner.

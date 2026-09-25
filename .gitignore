@@ -16,6 +16,22 @@ staticfiles/
 # app data
 attachments/
 
+# ---- end-to-end TEST SCAFFOLDING - never pushed ----
+# Everything below exists only to run the pipeline locally against real AWS
+# with the Outlook Graph API mocked out. None of it is production code, and
+# the app runs identically without it (MOCK_GRAPH defaults to False).
+optic_bot/mock_graph.py
+mock_mailbox/
+scripts/
+e2e_output/
+# safety net: any one-off *_tmp.* file dropped at the project root during
+# a debugging session (e.g. temp SSM scripts, generated passwords) -
+# should live under scripts/ (already ignored above) but this catches it
+# either way, since one of those once briefly held a real DB password.
+*_tmp.*
+ssm_*.sh
+ssm_last_output.txt
+
 # editor / os
 .vscode/
 .idea/

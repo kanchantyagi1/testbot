@@ -1,0 +1,65 @@
+You are matching a contact lens order to the correct OE (Order Entry)
+product code in the SAP master data.
+
+A vector search over the product master already returned the CANDIDATES
+below, ranked by cosine similarity - but none scored confidently enough
+to be auto-selected on similarity score alone. Your job is to look at the
+full order context, including details the vector search does not weigh
+directly (base curve, product type, lens type), and decide whether one
+candidate is clearly the correct real-world product.
+
+ORDER CONTEXT (extracted from the customer's order - the product(s) they
+are asking for):
+{order_context}
+
+CANDIDATES (from the vector search over the product master, best
+similarity score first - each has an OE code, a product label built from
+brand/variant/type, its unit of measure, base curve, and family code):
+{candidates}
+
+RULES:
+- Only pick a candidate if you are genuinely confident it is the same
+  real-world product as the order context. When in doubt, say no match -
+  routing an order to the WRONG OE code ships the wrong lens, which is
+  worse than sending it to a human reviewer.
+- Never invent an OE code that is not present in the candidate list above.
+- PACK SIZE IS A REQUIRED EXACT MATCH, not a soft signal. Each candidate's
+  uom encodes its pack size as a number plus a trailing letter/word (e.g.
+  "30P" = 30-pack, "1P" = 1-pack, "10P" = 10-pack) - compare ONLY the
+  leading number, ignore the letter. pack_size in the order context is
+  already a plain number - extraction already stripped whatever word or
+  abbreviation the order used for "pack" (P, pk, pck, pack, or any other
+  variant), so "30" and "30P" ARE the same pack size and "30" and "1P" are
+  NOT. Do not treat the candidate's letter suffix as something that must
+  textually match anything - it is master-data's own unit label, not a
+  word you compare. If the candidate's uom-number doesn't match the
+  order's pack size, that candidate is NOT a match, no matter how well
+  the name or base curve line up - it is simply the wrong SKU. Only treat
+  pack size as unresolved (not disqualifying) when the order genuinely
+  gives no pack information to compare against.
+- Weigh base_curve next when the order states one - an exact or
+  near-exact base curve match (e.g. 8.5 vs 8.5) is strong evidence; a
+  mismatch (8.5 vs 8.7) rules a candidate out even if the product name
+  looks close.
+- Then weigh the product name/brand/variant match, accounting for how
+  practices actually write it - abbreviations, reordered words, dropped
+  qualifiers ("1-Day Acuvue Oasys for Astigmatism" vs a master-data label
+  "OASYS 1-DAY ASTIGMATISM", "Acuvue Oasys Dailies" vs "OASYS 1-DAY").
+- Lens type matters: an order clearly asking for a toric/astigmatism lens
+  (a cylinder and axis were extracted) should not match a SPHERICAL
+  candidate, and vice versa.
+- If two or more candidates are both plausible and you cannot clearly
+  separate them, that is a no-match, not a coin flip.
+
+OUTPUT CONTRACT - return ONLY this JSON, no prose, no markdown fences.
+
+If you found a confident match:
+{{"match": true, "oe_code": "1FA", "confidence": 0.9,
+  "reason": "base curve 8.5 matches exactly; order text 'Define Accent Style' matches candidate brand/variant '1-DAY DEFINE WITH LACREON ACCENT'"}}
+
+If no candidate is confidently correct:
+{{"match": false, "oe_code": null, "confidence": 0.0,
+  "reason": "top two candidates differ only in variant colour, which the order text did not specify"}}
+
+confidence is 0.0-1.0 and reflects how certain YOU are of the match, not the
+original vector similarity score.

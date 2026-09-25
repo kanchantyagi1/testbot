@@ -10,6 +10,8 @@ attachment 2 is retried next time.
 
 STATUS values and what they mean:
     NEW           - row just created, nothing processed yet
+    QUEUED        - document is in S3 and an SQS message was sent; waiting
+                    for the worker to pick it up (USE_SQS=True only)
     PROCESSING    - sent to the LLM, waiting on the result
     NOT_AN_ORDER  - the file was a T&C / price list / logo, not a PO
                     (kept for audit, never shown to a reviewer)
@@ -31,6 +33,7 @@ from django.db import models
 class Order(models.Model):
     STATUS_CHOICES = [
         ("NEW", "New"),
+        ("QUEUED", "Queued"),
         ("PROCESSING", "Processing"),
         ("NOT_AN_ORDER", "Not an order"),
         ("NEEDS_REVIEW", "Needs review"),
@@ -60,7 +63,8 @@ class Order(models.Model):
     extracted_data = models.JSONField(default=dict, blank=True)
     min_confidence = models.FloatField(default=0.0, db_index=True)  # lowest field confidence
 
-    # ---- OE code, answered by the pgvector RAG agent (PLAN.md Appendix A) ----
+    # ---- OE code, answered by the pgvector RAG agent (PLAN.md Appendix A)
+    #      plus an LLM's explanation of the decision (PLAN.md §16) ----
     oe_code = models.CharField(max_length=50, blank=True)  # winning candidate
     oe_confidence = models.FloatField(default=0.0)  # similarity score 0-1
     oe_matched = models.BooleanField(default=False)  # score >= OE_MATCH_THRESHOLD
@@ -68,6 +72,15 @@ class Order(models.Model):
     # [{"oe_code": "OE-IN-0042", "customer_name": "...", "score": 0.91,
     #   "match_type": "vector"}, ...]
     oe_candidates = models.JSONField(default=list, blank=True)
+    # SAP unit of measure returned alongside the OE code by the product
+    # lookup (e.g. "5P" for a 30-pack). Fills SAPUoM_Right/Left in the CSV.
+    oe_uom = models.CharField(max_length=20, blank=True)
+    # Plain-English reason for the OE decision - ALWAYS populated whenever
+    # OE_MATCHING_ENABLED is True, whether matched or not (e.g. "customer_account
+    # matches exactly" or "top two candidates score nearly identically").
+    # This is the audit trail's answer to "why this OE code" - see
+    # services.lookup_oe_code().
+    oe_match_reason = models.TextField(blank=True)
 
     # ---- workflow ----
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="NEW", db_index=True)
