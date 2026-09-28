@@ -231,6 +231,7 @@ def config(request):
         "confidence_threshold": settings.CONFIDENCE_THRESHOLD,
         "mailbox": settings.MAILBOX_USER_EMAIL,
         "mail_target_folder": settings.MAIL_TARGET_FOLDER,
+        "mail_orders_folder": settings.MAIL_ORDERS_FOLDER,
         "mail_poll_minutes": settings.MAIL_POLL_MINUTES,
         "require_oe_match": settings.REQUIRE_OE_MATCH,
         "status_counts": counts,

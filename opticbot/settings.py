@@ -142,8 +142,31 @@ MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
 MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
 MAILBOX_USER_EMAIL = os.getenv("MAILBOX_USER_EMAIL", "")
 MAIL_TARGET_FOLDER = os.getenv("MAIL_TARGET_FOLDER", "OPTIC BOT")
+# child folder OF MAIL_TARGET_FOLDER that order emails are moved into; the
+# attachments + body are ingested from here (see services.poll_mailbox)
+MAIL_ORDERS_FOLDER = os.getenv("MAIL_ORDERS_FOLDER", "01 New Orders")
 MAIL_POLL_MINUTES = int(os.getenv("MAIL_POLL_MINUTES", "5"))
-MAIL_BATCH_SIZE = int(os.getenv("MAIL_BATCH_SIZE", "20"))
+MAIL_BATCH_SIZE = int(os.getenv("MAIL_BATCH_SIZE", "20"))  # max NEW emails handled per poll (and per sweep)
+# Watermark polling: each poll fetches OPTIC BOT mail received since (last
+# watermark - MAIL_OVERLAP_MINUTES). There is no age cap on the watermark, so a
+# big backlog drains over many polls without skipping anything.
+#
+# FIRST RUN (no watermark yet): how many DAYS back to read. 1 = the last day,
+# 7 = the last week, 0 = every email in the folder whatever its age. Mail
+# older than the window is never touched.
+MAIL_FIRST_RUN_DAYS = int(os.getenv("MAIL_FIRST_RUN_DAYS", "0"))
+# TEST SWITCH: stop after this many emails in total (0 = no limit). Lets you
+# run 20-30 emails end to end against a huge folder before opening the
+# floodgates. Counted from the database (distinct emails with Order rows), so
+# it holds across restarts; raise or unset it to continue - the watermark
+# picks up where the test stopped.
+MAIL_TEST_LIMIT = int(os.getenv("MAIL_TEST_LIMIT", "0"))
+MAIL_OVERLAP_MINUTES = int(os.getenv("MAIL_OVERLAP_MINUTES", "60"))
+# An email that keeps failing holds the watermark back and is retried every
+# poll; after this many hours of continuous failure the bot gives up on it and
+# moves on. Also how far behind the watermark the "01 New Orders" sweep looks.
+MAIL_RETRY_WINDOW_HOURS = int(os.getenv("MAIL_RETRY_WINDOW_HOURS", "72"))
+# cosmetic only now - read state no longer decides what gets fetched
 MARK_MAIL_AS_READ = env_bool("MARK_MAIL_AS_READ", "True")
 INCLUDE_BODY_AS_CONTEXT = env_bool("INCLUDE_BODY_AS_CONTEXT", "True")
 MAX_BODY_CHARS = int(os.getenv("MAX_BODY_CHARS", "4000"))

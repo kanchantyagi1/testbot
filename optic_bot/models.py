@@ -1,5 +1,6 @@
 """
-OPTIC BOT data model - exactly two tables.
+OPTIC BOT data model - Order + AuditLog, plus MailWatermark (the mailbox
+poller's position, see below).
 
 One Order row = one email ATTACHMENT (not one email - an email can carry
 several order files: PDF, Word, Excel...). Dedupe key is
@@ -105,6 +106,41 @@ class Order(models.Model):
 
     def __str__(self):
         return f"Order #{self.pk} [{self.status}] {self.attachment_name}"
+
+
+class MailWatermark(models.Model):
+    """How far the mailbox poller has got in the OPTIC BOT folder.
+
+    received_at is the receivedDateTime of the newest email in the unbroken
+    run of emails handled successfully from the start of the last fetch - it
+    does NOT move past an email that failed, so that email is retried on the
+    next poll. NULL until the first email has been handled (first run). The
+    poller fetches from (received_at - MAIL_OVERLAP_MINUTES); the "already has
+    Order rows" check makes the overlap harmless.
+
+    stuck_since is when the current run of failures pinning the watermark
+    began (NULL = not stuck). Once it is older than MAIL_RETRY_WINDOW_HOURS the
+    poller gives up on the failing email - recording a FAILED Order row
+    (attachment_id="TRIAGE") so a person sees it - and moves on, so one
+    poisoned email cannot hold the poll back forever. See
+    services.poll_mailbox().
+    """
+    name = models.CharField(max_length=50, unique=True)
+    received_at = models.DateTimeField(null=True, blank=True)
+    stuck_since = models.DateTimeField(null=True, blank=True)
+    # set when an email was moved to "01 New Orders" but its ingest left no
+    # Order rows: the sweep reaches back at least this far until it has
+    # cleared the backlog. Cleared by a clean sweep.
+    sweep_from = models.DateTimeField(null=True, blank=True)
+    # poll lease: only one poller at a time, across processes/servers
+    # (scheduler, POST /api/poll/, extra gunicorn workers). Expires on its
+    # own so a crashed poller cannot block polling forever.
+    locked_until = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        when = f"{self.received_at:%Y-%m-%d %H:%M:%S}" if self.received_at else "not started"
+        return f"MailWatermark {self.name} @ {when}"
 
 
 class AuditLog(models.Model):

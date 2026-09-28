@@ -10,6 +10,11 @@ One file, seven sections:
     F. SAP CSV export     - approved order(s) -> CSV -> S3_OUTPUT_BUCKET
     G. SQS queue          - ingest -> execution queue -> worker -> DLQ
 
+Mailbox flow (see poll_mailbox): OPTIC BOT is polled by date via a
+watermark; order emails are moved to "01 New Orders" and ingested from
+there (only that folder's mail reaches S3); a sweep of "01 New Orders"
+recovers ingests that failed after the move.
+
 RULE FOR THIS FILE: no boto3/msal client may be built at MODULE IMPORT time.
 Every client is built inside a function, after require() has already checked
 the credentials it needs. That is what lets `import optic_bot.services`
@@ -23,13 +28,15 @@ import json
 import logging
 import re
 import time
+from datetime import timedelta, timezone as dt_timezone
 
 import requests
 from django.conf import settings
 from django.db import connection
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
-from .models import AuditLog, Order
+from .models import AuditLog, MailWatermark, Order
 
 logger = logging.getLogger(__name__)
 
@@ -176,10 +183,17 @@ def build_headers(token):
     Outlook HTML is full of <style> blocks, conditional comments and tracking
     pixels, and a regex stripper leaves CSS junk in the middle of the order
     text. Let Graph do the conversion.
+
+    THE IMMUTABLE-ID RULE LIVES HERE TOO. IdType="ImmutableId" makes a
+    message keep the SAME Graph id when it is moved between folders of this
+    mailbox (a normal id changes on every move). That is what lets
+    Order.message_id / the S3 prefix / the CSV's GraphMailId stay the id the
+    email had when it arrived in OPTIC BOT. It must be sent on EVERY Graph
+    call - ids in the two formats are not interchangeable.
     """
     return {
         "Authorization": f"Bearer {token}",
-        "Prefer": 'outlook.body-content-type="text"',
+        "Prefer": 'outlook.body-content-type="text", IdType="ImmutableId"',
     }
 
 
@@ -199,25 +213,205 @@ def get_folder_id(headers):
     raise ConfigError(f"Folder '{settings.MAIL_TARGET_FOLDER}' not found under Inbox")
 
 
-def fetch_new_emails(headers, folder_id):
-    """Unread mail in the target folder, newest first."""
+def get_orders_folder_id(headers, parent_folder_id):
+    """Find the MAIL_ORDERS_FOLDER ("01 New Orders") child folder under the
+    OPTIC BOT folder (case-insensitive)."""
     require("MAILBOX_USER_EMAIL")
 
     url = (
         f"{GRAPH_BASE}/users/{settings.MAILBOX_USER_EMAIL}"
-        f"/mailFolders/{folder_id}/messages"
-        f"?$filter=isRead eq false"
-        f"&$top={settings.MAIL_BATCH_SIZE}"
-        f"&$orderby=receivedDateTime desc"
-        f"&$select=id,subject,from,receivedDateTime,body,hasAttachments"
+        f"/mailFolders/{parent_folder_id}/childFolders?$top=100"
     )
     response = requests.get(url, headers=headers, timeout=30)
     response.raise_for_status()
-    return response.json().get("value", [])
+
+    target = settings.MAIL_ORDERS_FOLDER.strip().lower()
+    for folder in response.json().get("value", []):
+        if folder.get("displayName", "").strip().lower() == target:
+            return folder["id"]
+
+    raise ConfigError(
+        f"Folder '{settings.MAIL_ORDERS_FOLDER}' not found under '{settings.MAIL_TARGET_FOLDER}'"
+    )
 
 
-def clean_body(mail):
+MAIL_FIELDS = "id,subject,from,receivedDateTime,body,hasAttachments,isRead"
+SCAN_FIELDS = "id,receivedDateTime"  # the folder scan is ids + dates only - no bodies
+SCAN_PAGE_SIZE = 500
+MAX_PAGES = 60  # safety stop when following @odata.nextLink (60 x 500 = 30k ids)
+
+
+def _graph_iso(dt):
+    return dt.astimezone(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iter_pages(headers, url, params):
+    """Yield items page by page, following @odata.nextLink. LAZY on purpose:
+    the poller stops asking as soon as it has enough new emails to work on,
+    so a 10k-email folder is never pulled down just to handle 20 of them."""
+    for _ in range(MAX_PAGES):
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        yield from data.get("value", [])
+        url = data.get("@odata.nextLink")
+        if not url:
+            return
+        params = None  # nextLink already carries the query
+    logger.warning("Stopped after %d pages of results - remainder left for the next poll", MAX_PAGES)
+
+
+def fetch_emails_since(headers, folder_id, since):
+    """Generator: {id, receivedDateTime} of every message in the folder
+    received at/after `since` (None = the whole folder, any age), OLDEST
+    FIRST. Deliberately light - no bodies - so re-scanning emails that are
+    already handled (the overlap window, or a pinned watermark) is cheap; the
+    poller fetches the full message with get_message() only for the ones
+    that need work. Read state is deliberately NOT part of the query - a
+    person opening an email must never make the bot skip it.
+
+    KEYSET PAGING, NOT @odata.nextLink. Graph's nextLink pages with $skip,
+    and the poller MOVES emails out of this folder while it walks the
+    listing - every move shifts the list under the next $skip and silently
+    jumps over that many emails. So each page is a fresh query from the last
+    receivedDateTime seen ("ge", de-duplicated by id), which a move cannot
+    disturb."""
+    require("MAILBOX_USER_EMAIL")
+
+    url = f"{GRAPH_BASE}/users/{settings.MAILBOX_USER_EMAIL}/mailFolders/{folder_id}/messages"
+    cursor, seen = since, set()
+    for _ in range(MAX_PAGES):
+        params = {
+            "$orderby": "receivedDateTime asc",
+            "$top": SCAN_PAGE_SIZE,
+            "$select": SCAN_FIELDS,
+        }
+        if cursor is not None:
+            params["$filter"] = f"receivedDateTime ge {_graph_iso(cursor)}"
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        response.raise_for_status()
+        page = response.json().get("value", [])
+
+        fresh = [m for m in page if m["id"] not in seen]
+        if not fresh:
+            return  # empty folder/window, or a full page of one timestamp we already saw
+        for m in fresh:
+            seen.add(m["id"])
+            yield m
+        if len(page) < SCAN_PAGE_SIZE:
+            return  # that was the last page
+        cursor = parse_datetime(page[-1]["receivedDateTime"])
+    logger.warning("Stopped after %d pages of results - remainder left for the next poll", MAX_PAGES)
+
+
+def list_message_ids_since(headers, folder_id, since):
+    """Just the ids (light) - used by the orders-folder sweep, which only
+    fetches the full message for the few that have no Order rows.
+    since=None lists the whole folder."""
+    require("MAILBOX_USER_EMAIL")
+
+    url = f"{GRAPH_BASE}/users/{settings.MAILBOX_USER_EMAIL}/mailFolders/{folder_id}/messages"
+    params = {
+        "$orderby": "receivedDateTime asc",
+        "$top": SCAN_PAGE_SIZE,
+        "$select": "id",
+    }
+    if since is not None:
+        params["$filter"] = f"receivedDateTime ge {_graph_iso(since)}"
+    return [m["id"] for m in _iter_pages(headers, url, params)]
+
+
+def get_message(headers, message_id):
+    require("MAILBOX_USER_EMAIL")
+
+    url = f"{GRAPH_BASE}/users/{settings.MAILBOX_USER_EMAIL}/messages/{message_id}"
+    response = requests.get(url, headers=headers, params={"$select": MAIL_FIELDS}, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+# --- watermark (position of the OPTIC BOT poll) -----------------------------
+
+WATERMARK_NAME = "incoming"
+
+
+def get_watermark_row():
+    row, _ = MailWatermark.objects.get_or_create(name=WATERMARK_NAME)
+    return row
+
+
+def advance_watermark(row, received_at):
+    """Only ever moves forward."""
+    if received_at is not None and (row.received_at is None or received_at > row.received_at):
+        row.received_at = received_at
+        row.save(update_fields=["received_at", "updated_at"])
+
+
+POLL_LEASE_MINUTES = 30  # longer than any sane poll; expires by itself if a poller dies
+
+
+def acquire_poll_lease():
+    """One atomic UPDATE ... WHERE lease is free - works on Postgres and
+    SQLite, across processes and servers. Returns True if this caller now
+    holds the lease."""
+    from django.db.models import Q
+
+    get_watermark_row()  # make sure the row exists
+    now = timezone.now()
+    taken = MailWatermark.objects.filter(
+        Q(locked_until__isnull=True) | Q(locked_until__lt=now), name=WATERMARK_NAME
+    ).update(locked_until=now + timedelta(minutes=POLL_LEASE_MINUTES))
+    return taken == 1
+
+
+def renew_poll_lease():
+    """Called before each email that needs real work: a long inline poll
+    (20 emails x several LLM calls) can outlast POLL_LEASE_MINUTES, and the
+    lease must not expire under a poller that is still alive."""
+    MailWatermark.objects.filter(name=WATERMARK_NAME).update(
+        locked_until=timezone.now() + timedelta(minutes=POLL_LEASE_MINUTES)
+    )
+
+
+def release_poll_lease():
+    MailWatermark.objects.filter(name=WATERMARK_NAME).update(locked_until=None)
+
+
+def set_stuck_since(row, when):
+    if row.stuck_since != when:
+        row.stuck_since = when
+        row.save(update_fields=["stuck_since", "updated_at"])
+
+
+def fetch_floor(watermark):
+    """Where this poll's fetch starts.
+
+    With a watermark: (watermark - overlap). NO age cap - while a big backlog
+    drains, the watermark sits far in the past and must be honoured, or the
+    emails between it and "now" would be skipped.
+
+    First run (no watermark yet): MAIL_FIRST_RUN_DAYS days back, or None =
+    the whole folder whatever the age of the mail."""
+    if watermark is not None:
+        return watermark - timedelta(minutes=settings.MAIL_OVERLAP_MINUTES)
+    if settings.MAIL_FIRST_RUN_DAYS > 0:
+        return timezone.now() - timedelta(days=settings.MAIL_FIRST_RUN_DAYS)
+    return None
+
+
+def sweep_floor(watermark):
+    """How far back the "01 New Orders" sweep looks. Measured BEHIND THE
+    WATERMARK, not behind "now": receivedDateTime is the original delivery
+    time, and while a backlog drains the emails just moved are as old as the
+    watermark. First run: the same window as the main fetch."""
+    if watermark is None:
+        return fetch_floor(None)
+    return watermark - timedelta(hours=settings.MAIL_RETRY_WINDOW_HOURS)
+
+
+def clean_body(mail, truncate=True):
     """Plain-text body, trimmed, ready to store and to send as LLM context.
+    truncate=False keeps the whole body (used for the S3 copy).
 
     Safety net only: if body.contentType somehow comes back as html (a proxy
     dropped the Prefer header), fall back to a plain regex tag-stripper - do
@@ -233,7 +427,7 @@ def clean_body(mail):
 
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text[: settings.MAX_BODY_CHARS]
+    return text[: settings.MAX_BODY_CHARS] if truncate else text
 
 
 def list_attachments(headers, message_id):
@@ -288,6 +482,27 @@ def download_attachment(headers, message_id, attachment_id):
     return response.content
 
 
+def move_email(headers, message_id, destination_folder_id):
+    """Move a message into another folder. RETURNS THE NEW GRAPH MESSAGE ID.
+
+    Graph gives a moved message a NEW id (it is a copy in the destination
+    folder). Everything that identifies the email from here on - the Order
+    rows, the S3 key prefix, the CSV's GraphMailId - must use the id of the
+    message as it sits in the destination folder, which is why ingest reads
+    the message back out of that folder rather than reusing the old id.
+    """
+    require("MAILBOX_USER_EMAIL")
+
+    url = f"{GRAPH_BASE}/users/{settings.MAILBOX_USER_EMAIL}/messages/{message_id}/move"
+    post_headers = dict(headers)
+    post_headers["Content-Type"] = "application/json"
+    response = requests.post(
+        url, headers=post_headers, json={"destinationId": destination_folder_id}, timeout=30
+    )
+    response.raise_for_status()
+    return response.json()["id"]
+
+
 def mark_email_read(headers, message_id):
     if not settings.MARK_MAIL_AS_READ:
         return
@@ -327,6 +542,22 @@ def upload_to_s3(file_bytes, key, bucket=None):
         Body=file_bytes,
         ServerSideEncryption="aws:kms",
     )
+    return key
+
+
+def body_s3_key(message_id):
+    """Sits next to the attachments: {message_id}/body.txt. Derived, not
+    stored - message_id is already on every Order row."""
+    return f"{message_id}/body.txt"
+
+
+def upload_body_to_s3(mail):
+    """The email's full plain-text body, once per email (not per attachment).
+    No-op when S3_INPUT_BUCKET isn't configured, like the attachment upload."""
+    if not settings.S3_INPUT_BUCKET:
+        return None
+    key = body_s3_key(mail["id"])
+    upload_to_s3(clean_body(mail, truncate=False).encode("utf-8"), key)
     return key
 
 
@@ -1188,9 +1419,67 @@ def _record_communication_email(mail, reason, confidence):
     return order
 
 
-def process_email(mail, headers):
-    """One email -> N Order rows: one per usable attachment, or one for
-    the email body when the order is typed into the email itself."""
+def triage_email(mail, headers, orders_folder_id):
+    """One email in the OPTIC BOT folder: classify it, and if it is an order
+    MOVE it to the orders folder ("01 New Orders").
+
+    Nothing is downloaded, stored or extracted here - the caller ingests a
+    moved email straight afterwards with process_order_email(). If the move
+    fails the email stays in OPTIC BOT and is retried next poll (the
+    watermark does not move past it). Fails open like the classifier: an
+    unclassifiable email is moved.
+
+    Returns "skipped" (already has Order rows - seen on an earlier poll, e.g.
+    inside the watermark overlap), "moved", "not_order" or "failed", plus an
+    error string.
+    """
+    message_id = mail["id"]
+
+    # Checked BEFORE the LLM classifier so the overlap window never pays for
+    # a second classification. Any row at all means this email was handled.
+    if Order.objects.filter(message_id=message_id).exists():
+        return "skipped", ""
+
+    try:
+        attachments = list_attachments(headers, message_id)
+    except Exception as e:
+        logger.exception("Could not list attachments for message_id=%s", message_id)
+        return "failed", str(e)
+
+    # see prompts/email_classification.txt. Fails open (treats as order).
+    is_order_email, class_confidence, class_reason = classify_email(
+        mail, [a.get("name", "") for a in attachments]
+    )
+    if not is_order_email:
+        _record_communication_email(mail, class_reason, class_confidence)
+        try:
+            mark_email_read(headers, message_id)
+        except Exception:
+            logger.exception("Could not mark message_id=%s as read", message_id)
+        return "not_order", ""
+
+    try:
+        new_id = move_email(headers, message_id, orders_folder_id)
+    except Exception as e:
+        logger.exception("Could not move message_id=%s to '%s'", message_id, settings.MAIL_ORDERS_FOLDER)
+        return "failed", str(e)
+
+    if new_id != message_id:
+        # would break the id-stays-the-same guarantee (see build_headers)
+        logger.warning("Graph id changed on move: %s -> %s", message_id, new_id)
+    logger.info("Moved order email to '%s'", settings.MAIL_ORDERS_FOLDER)
+    return "moved", ""
+
+
+def process_order_email(mail, headers):
+    """One email already sitting in the orders folder: body -> S3, then one
+    Order row per usable attachment (each attachment -> S3), or one for the
+    email body when the order is typed into the email itself. Attachments
+    are listed afresh from the moved message, not reused from triage.
+
+    Safe to call twice for the same email (per-attachment dedupe). If it
+    fails before any Order row exists, the sweep of the orders folder
+    (sweep_orders_folder) picks the email up again."""
     message_id = mail["id"]
     summary = {
         "attachments_found": 0, "orders_created": 0, "queued": 0,
@@ -1199,23 +1488,11 @@ def process_email(mail, headers):
 
     try:
         attachments = list_attachments(headers, message_id)
+        upload_body_to_s3(mail)
     except Exception as e:
-        logger.exception("Could not list attachments for message_id=%s", message_id)
+        # no Order row yet -> the orders-folder sweep retries this email
+        logger.exception("Could not list attachments / store body for message_id=%s", message_id)
         summary["errors"].append(str(e))
-        return summary
-
-    # Triage BEFORE downloading or extracting anything - see
-    # prompts/email_classification.txt. Fails open (treats as order).
-    is_order_email, class_confidence, class_reason = classify_email(
-        mail, [a.get("name", "") for a in attachments]
-    )
-    if not is_order_email:
-        _record_communication_email(mail, class_reason, class_confidence)
-        summary["not_orders"] += 1
-        try:
-            mark_email_read(headers, message_id)
-        except Exception:
-            logger.exception("Could not mark message_id=%s as read", message_id)
         return summary
 
     if not attachments:
@@ -1283,38 +1560,239 @@ def process_email(mail, headers):
 
 def poll_mailbox():
     """Called by the scheduler AND by POST /api/poll/. Returns a summary dict
-    counted PER ATTACHMENT, not per email.
+    counted PER ATTACHMENT, not per email (emails_checked = emails newly
+    triaged this poll; already-handled ones inside the overlap are not counted).
+
+    Fetches by DATE (a watermark on receivedDateTime), not by unread state,
+    so a person opening an email can never make it invisible to the bot.
 
     Raises ConfigError if Outlook settings are missing - the view turns that
     into a clean 400, and the scheduler just logs it and waits for the next
     tick. Everything else (a bad email, a bad attachment) is caught and
     recorded in summary['errors'] instead of raising, so one bad message
     never stops the rest of the batch.
+
+    Only ONE poll runs at a time, across processes and servers (a lease on
+    the MailWatermark row). A second caller gets {"busy": true} back at once.
     """
+    if not acquire_poll_lease():
+        logger.info("Another poll is already running - skipping this one")
+        return {"busy": True, "errors": []}
+    try:
+        return _poll_mailbox_locked()
+    finally:
+        release_poll_lease()
+
+
+def _poll_mailbox_locked():
+    summary = {
+        "emails_checked": 0, "moved_to_orders": 0, "swept": 0,
+        "attachments_found": 0, "orders_created": 0, "queued": 0,
+        "skipped": 0, "not_orders": 0, "failed": 0, "errors": [],
+    }
+    ingested_ids = set()  # emails already attempted this poll - the sweep leaves them alone
+
+    # MAIL_TEST_LIMIT: a hard stop on the total number of emails the bot will
+    # ever handle. Checked BEFORE any Graph call, so a reached limit costs
+    # nothing per scheduler tick.
+    room = mail_limit_room()
+    if room is not None:
+        summary["test_limit"] = settings.MAIL_TEST_LIMIT
+        if room <= 0:
+            summary["test_limit_reached"] = True
+            logger.info(
+                "MAIL_TEST_LIMIT=%s reached - not fetching mail. Raise or unset it to continue.",
+                settings.MAIL_TEST_LIMIT,
+            )
+            return summary
+
     token = get_graph_token()          # raises ConfigError if MS_* missing
     headers = build_headers(token)
     folder_id = get_folder_id(headers)  # raises ConfigError if folder not found
-    emails = fetch_new_emails(headers, folder_id)
+    orders_folder_id = get_orders_folder_id(headers, folder_id)  # ditto
 
-    summary = {
-        "emails_checked": len(emails), "attachments_found": 0,
-        "orders_created": 0, "queued": 0, "skipped": 0, "not_orders": 0,
-        "failed": 0, "errors": [],
-    }
-
-    for mail in emails:
-        try:
-            email_summary = process_email(mail, headers)
-        except Exception as e:
-            logger.exception("process_email raised unexpectedly for message_id=%s", mail.get("id"))
-            summary["errors"].append(str(e))
-            continue
-
+    def merge(email_summary):
         for key in ("attachments_found", "orders_created", "queued", "skipped", "not_orders", "failed"):
             summary[key] += email_summary.get(key, 0)
         summary["errors"].extend(email_summary.get("errors", []))
 
+    # ---- 1. OPTIC BOT: everything received since the watermark, oldest
+    #         first. Orders are moved to "01 New Orders" and ingested
+    #         straight away from there. ----
+    wm_row = get_watermark_row()
+    watermark = wm_row.received_at   # None on the very first run
+    incoming = fetch_emails_since(headers, folder_id, fetch_floor(watermark))
+
+    # the watermark may only advance over an UNBROKEN run of handled emails:
+    # stop at the first failure so that email is retried next poll - until it
+    # has been failing for MAIL_RETRY_WINDOW_HOURS, then give up on it
+    new_watermark, run_unbroken = None, True
+    budget = settings.MAIL_BATCH_SIZE if room is None else min(settings.MAIL_BATCH_SIZE, room)
+    ingest_pending_from = None  # oldest email this poll moved but could not ingest
+
+    for listed in incoming:
+        if budget <= 0:
+            break  # rest next poll; the watermark stops where we stopped
+
+        mail = listed  # just {id, receivedDateTime} until we know it needs work
+        if Order.objects.filter(message_id=listed["id"]).exists():
+            outcome, error = "skipped", ""   # handled on an earlier poll - costs no Graph call
+        else:
+            renew_poll_lease()
+            try:
+                mail = get_message(headers, listed["id"])
+                outcome, error = triage_email(mail, headers, orders_folder_id)
+            except Exception as e:
+                logger.exception("triage raised unexpectedly for message_id=%s", listed["id"])
+                outcome, error = "failed", str(e)
+
+        if outcome != "skipped":
+            budget -= 1
+            summary["emails_checked"] += 1
+
+        if outcome == "moved":
+            summary["moved_to_orders"] += 1
+            ingested_ids.add(mail["id"])
+            try:
+                merge(process_order_email(mail, headers))
+            except Exception as e:
+                logger.exception("process_order_email raised unexpectedly for message_id=%s", mail["id"])
+                summary["errors"].append(str(e))
+            # counts as handled for the watermark: the email is safely in the
+            # orders folder. If the ingest left no Order rows, remember how
+            # far back the sweep must reach to retry it.
+            if not Order.objects.filter(message_id=mail["id"]).exists():
+                received = parse_datetime(listed["receivedDateTime"])
+                if received and (ingest_pending_from is None or received < ingest_pending_from):
+                    ingest_pending_from = received
+        elif outcome == "not_order":
+            summary["not_orders"] += 1
+        elif outcome == "failed":
+            summary["failed"] += 1
+            summary["errors"].append(error)
+            if run_unbroken:  # only the FIRST failure of a poll decides whether to pin
+                stuck_for = timezone.now() - wm_row.stuck_since if wm_row.stuck_since else None
+                if stuck_for is not None and stuck_for >= timedelta(hours=settings.MAIL_RETRY_WINDOW_HOURS):
+                    msg = (f"gave up on email {listed['id']} after failing for "
+                           f"{settings.MAIL_RETRY_WINDOW_HOURS}h: {error}")
+                    logger.error(msg)
+                    summary["errors"].append(msg)
+                    _record_given_up_email(mail, listed, msg)  # visible to a reviewer, not just a log line
+                    set_stuck_since(wm_row, None)  # fresh clock for whatever fails next
+                    # run_unbroken stays True: the watermark moves past it
+                else:
+                    if wm_row.stuck_since is None:
+                        set_stuck_since(wm_row, timezone.now())
+                    run_unbroken = False
+
+        if run_unbroken:
+            new_watermark = parse_datetime(listed["receivedDateTime"]) or new_watermark
+
+    advance_watermark(wm_row, new_watermark)
+    if run_unbroken:
+        set_stuck_since(wm_row, None)  # nothing is holding the watermark back
+
+    # ---- 2. sweep "01 New Orders" for emails with no Order rows ----
+    # normally the MAIL_RETRY_WINDOW_HOURS behind the watermark, but reaching
+    # back to any earlier ingest that is still outstanding (sweep_from) - while
+    # a backlog drains the watermark can jump days in one poll
+    floor = sweep_floor(watermark)
+    if floor is not None and wm_row.sweep_from is not None:
+        floor = min(floor, wm_row.sweep_from - timedelta(minutes=1))
+
+    sweep_clean = False
+    room = mail_limit_room()  # emails handled above count against the limit
+    if room is None or room > 0:
+        sweep_budget = settings.MAIL_BATCH_SIZE if room is None else min(settings.MAIL_BATCH_SIZE, room)
+        sweep_clean = sweep_orders_folder(
+            headers, orders_folder_id, floor, ingested_ids, summary, merge, sweep_budget
+        )
+
+    if ingest_pending_from is not None:
+        if wm_row.sweep_from is None or ingest_pending_from < wm_row.sweep_from:
+            wm_row.sweep_from = ingest_pending_from
+            wm_row.save(update_fields=["sweep_from", "updated_at"])
+    elif sweep_clean and wm_row.sweep_from is not None:
+        wm_row.sweep_from = None   # everything back to it is ingested
+        wm_row.save(update_fields=["sweep_from", "updated_at"])
+
+    if room is not None and room <= 0:
+        summary["test_limit_reached"] = True
+
     return summary
+
+
+def mail_limit_room():
+    """None when MAIL_TEST_LIMIT is off (0); otherwise how many more emails
+    may be handled. "Handled" = distinct emails that have Order rows -
+    non-order emails (their NOT_AN_ORDER row) and order emails alike - so the
+    count survives restarts and every scheduler tick."""
+    limit = settings.MAIL_TEST_LIMIT
+    if not limit:
+        return None
+    handled = Order.objects.values("message_id").distinct().count()
+    return max(limit - handled, 0)
+
+
+def sweep_orders_folder(headers, orders_folder_id, since, skip_ids, summary, merge, budget):
+    """Ingest emails sitting in the orders folder that have NO Order rows -
+    an ingest that failed right after the move (S3/Graph hiccup), or an
+    email a person dragged into the folder by hand. Does one light id-only
+    listing (received since `since`; None = whole folder), fetching the full
+    message only for the few that need work. Never raises.
+
+    Returns True when the sweep is CLEAN: every email in the window now has
+    Order rows (nothing failed, nothing left over for lack of budget)."""
+    try:
+        message_ids = list_message_ids_since(headers, orders_folder_id, since)
+    except Exception as e:
+        logger.exception("Could not list the orders folder for the sweep")
+        summary["errors"].append(str(e))
+        return False
+
+    clean = True
+    for message_id in message_ids:
+        if message_id in skip_ids or Order.objects.filter(message_id=message_id).exists():
+            continue
+        if budget <= 0:
+            clean = False  # more waiting than this poll may handle
+            break
+
+        budget -= 1
+        renew_poll_lease()
+        try:
+            mail = get_message(headers, message_id)
+            merge(process_order_email(mail, headers))
+        except Exception as e:
+            logger.exception("Sweep failed for message_id=%s", message_id)
+            summary["errors"].append(str(e))
+        if Order.objects.filter(message_id=message_id).exists():
+            summary["swept"] += 1
+            logger.info("Swept unprocessed email from '%s'", settings.MAIL_ORDERS_FOLDER)
+        else:
+            clean = False
+    return clean
+
+
+def _record_given_up_email(mail, listed, message):
+    """The bot has stopped retrying this email. Leave a FAILED Order row
+    (attachment_id="TRIAGE") so it shows up for a reviewer to handle by hand
+    instead of vanishing into a log file. `mail` may be only the light
+    {id, receivedDateTime} listing if fetching the full message was the
+    thing that kept failing."""
+    Order.objects.get_or_create(
+        message_id=listed["id"],
+        attachment_id="TRIAGE",
+        defaults={
+            "sender": _sender_of(mail),
+            "subject": mail.get("subject", ""),
+            "received_at": listed.get("receivedDateTime") or None,
+            "attachment_name": "(email - bot gave up)",
+            "file_type": "email",
+            "status": "FAILED",
+            "error_message": message,
+        },
+    )
 
 
 def reprocess_order(order):
@@ -1358,7 +1836,8 @@ def reprocess_order(order):
 # An order with no line items still gets one row, with the item columns
 # blank, so it isn't silently dropped from the export.
 
-# Exactly the 29 columns from the "Required Fields" sheet, in that order.
+# The 29 columns from the "Required Fields" sheet, in that order, plus
+# GraphMailId appended at the end.
 # NOTE ON THE "1" SUFFIX: columns ending in 1 (AddPower1, Axis1, BaseCurve1,
 # Cylinder1, Descriptions1, OrderQuantity1, Sphere1) are the RIGHT eye, and
 # the unsuffixed ones (AddPower, Axis, ...) are the LEFT eye. The sample
@@ -1400,6 +1879,7 @@ SAP_CSV_COLUMNS = [
     "SAPUoM_Right",
     "SAPOECode_Left",
     "SAPUoM_Left",
+    "GraphMailId",          # Graph id of the source email in "01 New Orders" (order.message_id)
 ]
 
 # Per-eye CSV column stem -> key inside the extraction's right_eye/left_eye
@@ -1462,6 +1942,7 @@ def build_sap_rows(order):
         "SAPUoM_Right": order.oe_uom,
         "SAPOECode_Left": order.oe_code,
         "SAPUoM_Left": order.oe_uom,
+        "GraphMailId": order.message_id,
     }
 
     line_items = data.get("line_items") or []
@@ -1516,7 +1997,7 @@ def export_order_to_csv(order):
     # misreading special characters as a different encoding.
     csv_bytes = buffer.getvalue().encode("utf-8-sig")
 
-    po_number = (order.extracted_data.get("customer_po_number") or {}).get("value") or "no-po"
+    po_number = _leaf((order.extracted_data or {}).get("order"), "po_number") or "no-po"
     safe_po = re.sub(r"[^A-Za-z0-9_-]+", "_", str(po_number))
     date_prefix = timezone.now().strftime("%Y-%m-%d")
     key = f"exports/{date_prefix}/order-{order.id}-{safe_po}.csv"
