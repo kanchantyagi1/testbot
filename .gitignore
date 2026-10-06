@@ -1,8 +1,16 @@
 # secrets
 .env
+# one-off scratch scripts at the repo root - these have held real API keys
+test.py
 
 # local reference material (architecture/code screenshots) - never pushed
 reference-images/
+# REAL CUSTOMER DATA - patient names, prescriptions, addresses, account
+# numbers from the live mailbox, plus the OE master extract. Health data for
+# identifiable people: keep it local, never commit it.
+actualemail&actualmasteroedata/
+# derived patch files generated during analysis
+accuracy_patch/
 
 # python
 __pycache__/
@@ -15,6 +23,7 @@ staticfiles/
 
 # app data
 attachments/
+local_storage/
 
 # ---- end-to-end TEST SCAFFOLDING - never pushed ----
 # Everything below exists only to run the pipeline locally against real AWS

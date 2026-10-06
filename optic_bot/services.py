@@ -4,7 +4,8 @@ OPTIC BOT pipeline - Outlook polling, S3 upload, LLM extraction, OE lookup.
 One file, seven sections:
     A. config guard      - require() raises a clear error instead of a crash
     B. Outlook / Graph    - MSAL auth + reading the shared mailbox
-    C. S3 + OE lookup     - upload attachments, ask the RAG agent for an OE code
+    C. storage + OE lookup - upload attachments (S3, or a local folder when
+                             STORAGE_PROVIDER=local), ask the RAG agent for an OE code
     D. LLM extraction     - Bedrock/gateway converse call + JSON parsing
     E. the pipeline       - ties everything together into Order rows
     F. SAP CSV export     - approved order(s) -> CSV -> S3_OUTPUT_BUCKET
@@ -29,6 +30,7 @@ import logging
 import re
 import time
 from datetime import timedelta, timezone as dt_timezone
+from pathlib import Path
 
 import requests
 from django.conf import settings
@@ -557,7 +559,7 @@ def upload_body_to_s3(mail):
     if not settings.S3_INPUT_BUCKET:
         return None
     key = body_s3_key(mail["id"])
-    upload_to_s3(clean_body(mail, truncate=False).encode("utf-8"), key)
+    store_document(clean_body(mail, truncate=False).encode("utf-8"), key)
     return key
 
 
@@ -579,6 +581,79 @@ def presigned_url(key, seconds=3600, bucket=None):
     except Exception:
         logger.exception("presigned_url failed for key=%s", key)
         return None
+
+
+# --- storage provider dispatch (STORAGE_PROVIDER=s3, the default, or
+#     "local" for testing with no AWS account) -------------------------------
+#
+# store_document / load_document / document_url are what the rest of this
+# file calls - never upload_to_s3/s3_client/presigned_url directly - so a
+# document written while testing locally and one written against real S3
+# live at the exact same (bucket, key) address either way. Switching
+# STORAGE_PROVIDER back to "s3" needs no code change and no re-keying.
+
+def _local_storage_root():
+    root = Path(settings.LOCAL_STORAGE_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _local_path(bucket, key):
+    """Local-mode equivalent of an S3 (bucket, key) address: a path under
+    LOCAL_STORAGE_DIR/<bucket>/<key>. Rejects any key that would resolve
+    outside its bucket directory (e.g. "../../etc/passwd") - an attachment
+    name or Graph id is untrusted input and must never be used to write or
+    read outside the storage root."""
+    if not bucket:
+        raise ConfigError("Missing S3_INPUT_BUCKET or S3_OUTPUT_BUCKET in .env")
+    root = (_local_storage_root() / bucket).resolve()
+    path = (root / key).resolve()
+    if not (path == root or path.is_relative_to(root)):
+        raise ValueError(f"Unsafe storage key: {key!r}")
+    return path
+
+
+def store_document(file_bytes, key, bucket=None):
+    """Write. Real S3 (upload_to_s3) or LOCAL_STORAGE_DIR - see the module
+    note above."""
+    bucket = bucket or settings.S3_INPUT_BUCKET
+    if settings.STORAGE_PROVIDER == "local":
+        path = _local_path(bucket, key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(file_bytes)
+        return key
+    return upload_to_s3(file_bytes, key, bucket=bucket)
+
+
+def load_document(key, bucket=None):
+    """Read - the counterpart to store_document(). Used by reprocess_order()
+    and the SQS worker's _load_file_bytes()."""
+    bucket = bucket or settings.S3_INPUT_BUCKET
+    if settings.STORAGE_PROVIDER == "local":
+        return _local_path(bucket, key).read_bytes()
+    client = s3_client()
+    obj = client.get_object(Bucket=bucket, Key=key)
+    return obj["Body"].read()
+
+
+def document_url(key, seconds=3600, bucket=None):
+    """Download reference for the order-detail API's source_url/export_url.
+
+    S3 mode: a real presigned URL (presigned_url()). Local mode: the file's
+    absolute path on disk, as a plain string - NOT a fetchable HTTP URL,
+    since a local folder has no equivalent of a presigned link. Good enough
+    for testing on the same machine; it is not meant to be opened by a
+    separate reviewer frontend. Never raises; None if not configured or the
+    key/bucket is missing, matching presigned_url()."""
+    bucket = bucket or settings.S3_INPUT_BUCKET
+    if not key or not bucket:
+        return None
+    if settings.STORAGE_PROVIDER == "local":
+        try:
+            return str(_local_path(bucket, key))
+        except ValueError:
+            return None
+    return presigned_url(key, seconds=seconds, bucket=bucket)
 
 
 def get_query_embedding(text):
@@ -1243,7 +1318,7 @@ def ingest_attachment(mail, att, headers):
         # attachment_id in the key stops two same-named files in one
         # email from overwriting each other in S3
         key = f"{message_id}/{attachment_id}_{attachment_name}"
-        upload_to_s3(file_bytes, key)
+        store_document(file_bytes, key)
         order.s3_key = key
         order.save(update_fields=["s3_key"])
 
@@ -1803,9 +1878,7 @@ def reprocess_order(order):
     if not order.s3_key:
         raise ConfigError("Cannot reprocess: no s3_key stored for this order")
 
-    client = s3_client()
-    obj = client.get_object(Bucket=settings.S3_INPUT_BUCKET, Key=order.s3_key)
-    file_bytes = obj["Body"].read()
+    file_bytes = load_document(order.s3_key)
 
     order.status = "PROCESSING"
     order.save(update_fields=["status"])
@@ -2002,7 +2075,7 @@ def export_order_to_csv(order):
     date_prefix = timezone.now().strftime("%Y-%m-%d")
     key = f"exports/{date_prefix}/order-{order.id}-{safe_po}.csv"
 
-    upload_to_s3(csv_bytes, key, bucket=settings.S3_OUTPUT_BUCKET)
+    store_document(csv_bytes, key, bucket=settings.S3_OUTPUT_BUCKET)
 
     order.exported_at = timezone.now()
     order.export_s3_key = key
@@ -2077,9 +2150,7 @@ def _load_file_bytes(order):
     if order.attachment_id == "BODY" or not order.s3_key:
         return None
 
-    client = s3_client()
-    obj = client.get_object(Bucket=settings.S3_INPUT_BUCKET, Key=order.s3_key)
-    return obj["Body"].read()
+    return load_document(order.s3_key)
 
 
 def process_queued_message(message):

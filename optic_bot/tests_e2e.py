@@ -22,7 +22,9 @@ import csv
 import io
 import json
 import re
+import tempfile
 from datetime import timedelta
+from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -582,3 +584,37 @@ class EndToEnd(TestCase):
             s.poll_mailbox()
         self.assertEqual(g.in_folder(NO), sorted(ids))
         self.assertEqual(g.count("GET", rf"^mailFolders/{OB}/messages$"), 3)   # 3 + 3 + 2
+
+    def test_17_full_pipeline_with_local_storage_instead_of_s3(self):
+        """Same pipeline as test_01, but STORAGE_PROVIDER=local: proves the
+        whole poll -> ingest -> extract -> export flow works with zero AWS,
+        writes to disk instead of FakeS3 (which stays untouched), and
+        reprocess() reads the same file straight back off disk."""
+        with tempfile.TemporaryDirectory() as tmp, override_settings(
+            STORAGE_PROVIDER="local", LOCAL_STORAGE_DIR=tmp,
+        ):
+            g = self.graph
+            pdf = g.add(OB, self.ago(hours=1), "PO-9001 order", body="Acct 100200",
+                        attachments=[("PO_9001.pdf", b"%PDF-1.4 order")])
+            out = s.poll_mailbox()
+
+            self.assertEqual(out["moved_to_orders"], 1)
+            self.assertEqual(self.s3.objects, {})  # the real S3 client was never touched
+
+            body_path = Path(tmp) / "in-bucket" / pdf / "body.txt"
+            att_path = Path(tmp) / "in-bucket" / pdf / "att0_PO_9001.pdf"
+            self.assertEqual(body_path.read_text(), "Acct 100200")
+            self.assertEqual(att_path.read_bytes(), b"%PDF-1.4 order")
+
+            order = Order.objects.get(message_id=pdf, attachment_id="att0")
+            self.assertEqual(order.status, "AUTO_APPROVED")
+            self.assertEqual(order.s3_key, f"{pdf}/att0_PO_9001.pdf")
+            self.assertEqual(s.document_url(order.s3_key), str(att_path))
+
+            key = s.export_order_to_csv(order)
+            csv_path = Path(tmp) / "out-bucket" / key
+            self.assertTrue(csv_path.is_file())
+
+            # reprocess() reads the same file straight off disk
+            reprocessed = s.reprocess_order(order)
+            self.assertEqual(reprocessed.status, "AUTO_APPROVED")

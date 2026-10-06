@@ -36,11 +36,11 @@ from .services import (
     ConfigError,
     aws_credentials_status,
     collect_low_confidence_paths,
+    document_url,
     export_order_to_csv,
     log_audit,
     oe_master_status,
     poll_mailbox,
-    presigned_url,
     reprocess_order,
     score,
     set_by_path,
@@ -306,9 +306,9 @@ def get_order(request, order_id):
     order = get_object_or_404(Order, id=order_id)
 
     data = order_to_dict(order, include_fields=True, threshold=get_threshold(request))
-    data["source_url"] = presigned_url(order.s3_key)
+    data["source_url"] = document_url(order.s3_key)
     data["export_url"] = (
-        presigned_url(order.export_s3_key, bucket=settings.S3_OUTPUT_BUCKET)
+        document_url(order.export_s3_key, bucket=settings.S3_OUTPUT_BUCKET)
         if order.export_s3_key else None
     )
     data["sibling_attachments"] = list(

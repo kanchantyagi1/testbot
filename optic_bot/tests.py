@@ -5,7 +5,9 @@ Graph and the LLM are mocked; the database is the real (SQLite) test DB.
     python manage.py test optic_bot
 """
 
+import tempfile
 from datetime import timedelta
+from pathlib import Path
 from unittest import mock
 
 from django.test import TestCase, override_settings
@@ -275,3 +277,84 @@ class GraphContractTests(TestCase):
         s.advance_watermark(row, t)
         s.advance_watermark(row, t - timedelta(hours=1))
         self.assertEqual(MailWatermark.objects.get().received_at, t)
+
+
+class LocalStorageProviderTests(TestCase):
+    """STORAGE_PROVIDER=local - the AWS-free path for store_document /
+    load_document / document_url. Every test uses a throwaway temp
+    directory, never the real local_storage/ folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.override = override_settings(
+            STORAGE_PROVIDER="local", LOCAL_STORAGE_DIR=self.tmp.name,
+            S3_INPUT_BUCKET="in-bucket", S3_OUTPUT_BUCKET="out-bucket",
+        )
+        self.override.enable()
+        self.addCleanup(self.override.disable)
+
+    def test_store_and_load_roundtrip_on_disk(self):
+        key = s.store_document(b"hello world", "msg1/body.txt")
+        self.assertEqual(key, "msg1/body.txt")
+
+        on_disk = Path(self.tmp.name) / "in-bucket" / "msg1" / "body.txt"
+        self.assertEqual(on_disk.read_bytes(), b"hello world")
+        self.assertEqual(s.load_document("msg1/body.txt"), b"hello world")
+
+    def test_same_key_layout_as_s3_mode(self):
+        """The whole point: switching STORAGE_PROVIDER must not change any
+        key a caller passes in - same (bucket, key) address either way."""
+        s.store_document(b"x", "AAMk123=/att0_PO.pdf")
+        expected = Path(self.tmp.name) / "in-bucket" / "AAMk123=" / "att0_PO.pdf"
+        self.assertTrue(expected.is_file())
+
+    def test_document_url_returns_the_local_path_not_a_url(self):
+        s.store_document(b"csv,data", "exports/2026-01-01/order-1-PO.csv", bucket="out-bucket")
+        result = s.document_url("exports/2026-01-01/order-1-PO.csv", bucket="out-bucket")
+        expected = Path(self.tmp.name) / "out-bucket" / "exports" / "2026-01-01" / "order-1-PO.csv"
+        self.assertEqual(result, str(expected))
+
+    def test_path_traversal_is_rejected(self):
+        for bad_key in ("../../etc/passwd", "a/../../b"):
+            with self.assertRaises(ValueError):
+                s.store_document(b"x", bad_key)
+        # document_url fails the same way but returns None, like presigned_url does
+        self.assertIsNone(s.document_url("../../etc/passwd"))
+
+    def test_document_url_returns_none_for_a_missing_bucket_or_key(self):
+        self.assertIsNone(s.document_url(""))
+        with override_settings(S3_INPUT_BUCKET="", S3_OUTPUT_BUCKET=""):
+            self.assertIsNone(s.document_url("some/key"))
+
+    def test_directory_is_created_on_first_write(self):
+        self.assertFalse((Path(self.tmp.name) / "in-bucket").exists())
+        s.store_document(b"x", "a/b/c.txt")
+        self.assertTrue((Path(self.tmp.name) / "in-bucket" / "a" / "b" / "c.txt").is_file())
+
+
+class DefaultProviderIsS3Tests(TestCase):
+    """Without STORAGE_PROVIDER set, nothing should touch local disk - the
+    default must stay "s3", matching production before this feature existed."""
+
+    def test_store_document_goes_through_s3_when_provider_unset(self):
+        from django.conf import settings
+        self.assertEqual(settings.STORAGE_PROVIDER, "s3")
+
+        with mock.patch.object(s, "upload_to_s3") as upload:
+            s.store_document(b"x", "k", bucket="b")
+        upload.assert_called_once_with(b"x", "k", bucket="b")
+
+    def test_load_document_goes_through_s3_client_when_provider_unset(self):
+        fake_client = mock.Mock()
+        fake_client.get_object.return_value = {"Body": mock.Mock(read=lambda: b"bytes")}
+        with mock.patch.object(s, "s3_client", return_value=fake_client):
+            result = s.load_document("k", bucket="b")
+        self.assertEqual(result, b"bytes")
+        fake_client.get_object.assert_called_once_with(Bucket="b", Key="k")
+
+    def test_document_url_goes_through_presigned_url_when_provider_unset(self):
+        with mock.patch.object(s, "presigned_url", return_value="https://signed.example/x") as presigned:
+            result = s.document_url("k", bucket="b")
+        self.assertEqual(result, "https://signed.example/x")
+        presigned.assert_called_once_with("k", seconds=3600, bucket="b")

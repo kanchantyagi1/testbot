@@ -207,6 +207,20 @@ S3_INPUT_BUCKET = os.getenv("S3_INPUT_BUCKET", "")
 S3_OUTPUT_BUCKET = os.getenv("S3_OUTPUT_BUCKET", "")
 
 # ---------------------------------------------------------------------------
+# Storage provider - S3, or a local folder for testing with no AWS account
+# ---------------------------------------------------------------------------
+# Switches exactly like LLM_PROVIDER: "s3" (default, production) writes to
+# the real S3_INPUT_BUCKET/S3_OUTPUT_BUCKET above. "local" writes to
+# LOCAL_STORAGE_DIR on disk instead, using the SAME bucket names and object
+# keys as S3 (a bucket name just becomes a subfolder) - so a local test run
+# produces the identical layout a real S3 run would, and switching back to
+# "s3" once real AWS access exists is a one-line .env change: no code change,
+# no re-keying. See services.py Section C (store_document / load_document /
+# document_url).
+STORAGE_PROVIDER = os.getenv("STORAGE_PROVIDER", "s3").strip().lower()
+LOCAL_STORAGE_DIR = os.getenv("LOCAL_STORAGE_DIR", str(BASE_DIR / "local_storage"))
+
+# ---------------------------------------------------------------------------
 # OE master lookup - DIRECT pgvector query, same Postgres instance as
 # DATABASES['default'] above. No separate service, no URL - the backend
 # opens its own connection (django.db.connection, the one already
