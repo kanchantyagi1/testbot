@@ -157,11 +157,11 @@ anything not stated. Never invent a value to fill a gap.
    "customer_name":        {{"value": "BAILEYNELSON", "confidence": 0.95}},
    "customer_address":     {{"value": "NEWTOWN NSW 2042", "confidence": 0.9}},
    "po_number":            {{"value": "344114", "confidence": 0.97}},
-   "po_date":              {{"value": "2026-09-22", "confidence": 0.8}},
-   "order_type":           {{"value": "DX Order", "confidence": 0.7}},
-   "order_form_type":      {{"value": "DX", "confidence": 0.7}},
-   "patient_name":         {{"value": "Layal El-Khatib", "confidence": 0.93}},
-   "placed_by":            {{"value": "Margaret", "confidence": 0.6}},
+   "po_date":              {{"value": "2026-09-22", "confidence": 0.96}},
+   "order_type":           {{"value": "DX Order", "confidence": 0.95}},
+   "order_form_type":      {{"value": "DX", "confidence": 0.95}},
+   "patient_name":         {{"value": "Layal El-Khatib", "confidence": 0.96}},
+   "placed_by":            {{"value": "Margaret", "confidence": 0.95}},
    "trial_only":           {{"value": false, "confidence": 0.9}},
    "special_instructions": {{"value": "pick it up over counter and test it out", "confidence": 0.9}},
    "dtp_order":            {{"value": false, "confidence": 0.9}},
@@ -233,3 +233,11 @@ important the field is. A confident-looking guess is the most expensive
 mistake you can make here - when torn between two readings, pick the more
 likely one, give it a LOW confidence, and explain it in extraction_notes.
 Never raise confidence to make an order look cleaner.
+
+The example above is a CLEANLY PRINTED order, so nearly every field scores
+0.95+. That is the normal case - do not mark a field down just because it
+was short, or stated once, or sat in a signature block rather than a form
+field. A value that is plainly written scores 0.95+ even when it is minor.
+Reserve scores below 0.80 for values you genuinely had to INTERPRET:
+a misspelling, an abbreviation you expanded, an eye you inferred, a power
+list whose "x" could be a quantity or a multiplier.

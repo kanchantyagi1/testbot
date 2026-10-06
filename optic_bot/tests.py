@@ -358,3 +358,113 @@ class DefaultProviderIsS3Tests(TestCase):
             result = s.document_url("k", bucket="b")
         self.assertEqual(result, "https://signed.example/x")
         presigned.assert_called_once_with("k", seconds=3600, bucket="b")
+
+def leaf(value, confidence):
+    return {"value": value, "confidence": confidence}
+
+
+class CriticalConfidenceTests(TestCase):
+    """The auto-approval gate. Built from the REAL orders in
+    actualemail&actualmasteroedata/ - before this, min() over every field
+    sent all four to review, every one blocked by metadata."""
+
+    def eye_concepts(self):
+        """Every field explicitly labelled in the email body. The cleanest
+        order in the sample set - this one MUST auto-approve."""
+        return {
+            "order": {
+                "account_number": leaf("6273615", 0.98),
+                "customer_name": leaf("EYE CONCEPTS", 0.97),
+                "patient_name": leaf("Marino, Ignazia", 0.96),
+                "order_type": leaf("Trial Lens Order", 0.75),   # metadata, must not block
+                "order_form_type": leaf("DX", 0.70),            # metadata, must not block
+                "placed_by": leaf("Monica Tran", 0.60),         # metadata, must not block
+                "trial_only": leaf(True, 0.93),
+                "dtp_order": leaf(False, 0.9),
+            },
+            "line_items": [{
+                "product_description": leaf("J&J 1 Day Oasys MAX Multifocal - 30pk", 0.96),
+                "pack_size": leaf("30", 0.88),
+                "right_eye": {"order_quantity": leaf("1", 0.97), "base_curve": leaf("8.4", 0.97),
+                              "sphere": leaf("+3.00", 0.97), "add_power": leaf("MED", 0.9)},
+                "left_eye": {"order_quantity": leaf("1", 0.97), "base_curve": leaf("8.4", 0.97),
+                             "sphere": leaf("+2.75", 0.97), "add_power": leaf("MED", 0.9)},
+            }],
+        }
+
+    def test_metadata_alone_never_blocks_a_good_order(self):
+        fields = self.eye_concepts()
+        self.assertEqual(s.score(fields), 0.60)            # old gate: placed_by sank it
+        self.assertGreaterEqual(s.critical_confidence(fields), 0.85)
+        self.assertEqual(s.extraction_gaps(fields), [])
+
+    def test_a_bad_prescription_field_still_blocks(self):
+        """Vision-X: "+6.00 & +6.50" with no eye labels - real ambiguity,
+        and it must still go to a human."""
+        fields = self.eye_concepts()
+        fields["line_items"][0]["right_eye"]["sphere"] = leaf("+6.00", 0.60)
+        self.assertLess(s.critical_confidence(fields), 0.85)
+
+    def test_account_number_and_trial_only_are_critical(self):
+        for path, where in (("account_number", "order"), ("trial_only", "order")):
+            fields = self.eye_concepts()
+            fields[where][path] = leaf(fields[where][path]["value"], 0.50)
+            self.assertLess(s.critical_confidence(fields), 0.85, f"{path} should gate")
+
+    def test_dtp_address_is_critical_only_for_dtp_orders(self):
+        fields = self.eye_concepts()
+        fields["order"]["dtp_address_line1"] = leaf("503/1 Brightwell Lane", 0.55)
+        self.assertGreaterEqual(s.critical_confidence(fields), 0.85)  # not a DTP order
+
+        fields["order"]["dtp_order"] = leaf(True, 0.96)
+        self.assertLess(s.critical_confidence(fields), 0.85)          # ships to the patient
+
+    def test_incomplete_extraction_cannot_sneak_through(self):
+        """One high-scoring field must not look auto-approvable."""
+        sparse = {
+            "order": {"account_number": leaf("6222377", 0.99)},
+            "line_items": [{"product_description": leaf("Acuvue Oasys", 0.99)}],
+        }
+        self.assertEqual(s.critical_confidence(sparse), 0.99)
+        self.assertIn("no eye has both a power and a quantity", s.extraction_gaps(sparse))
+
+    def test_each_completeness_gap_is_reported(self):
+        self.assertIn("no account number", s.extraction_gaps({"line_items": []}))
+        self.assertIn("no line items", s.extraction_gaps({"order": {}}))
+        self.assertEqual(s.extraction_gaps(self.eye_concepts()), [])
+
+    def test_unspecified_eye_stock_line_counts_as_dispensable(self):
+        stock = {
+            "order": {"account_number": leaf("6235210", 0.98)},
+            "line_items": [{
+                "product_description": leaf("1-Day Acuvue Oasys 90pk", 0.95),
+                "unspecified_eye": {"sphere": leaf("-0.75", 0.95), "order_quantity": leaf("3", 0.95)},
+            }],
+        }
+        self.assertEqual(s.extraction_gaps(stock), [])
+
+    def test_gate_is_wired_into_the_status_decision(self):
+        """End to end through _extract_and_score: metadata at 0.60 must
+        still come out AUTO_APPROVED."""
+        order = Order(message_id="m1", attachment_id="BODY")
+        extraction = dict(self.eye_concepts(), is_order=True)
+        with mock.patch.object(s, "call_llm", return_value="{}"), \
+             mock.patch.object(s, "parse_llm_json", return_value=extraction), \
+             mock.patch.object(s, "lookup_oe_code", return_value=("MZM", 0.96, [], True, "ok")), \
+             mock.patch.object(s, "load_prompt", return_value="{sender}{subject}{body}"):
+            s._extract_and_score(order, file_bytes=None)
+        self.assertEqual(order.status, "AUTO_APPROVED")
+        self.assertGreaterEqual(order.min_confidence, 0.85)
+
+    def test_incomplete_order_is_held_even_with_an_oe_match(self):
+        order = Order(message_id="m2", attachment_id="BODY")
+        sparse = {"is_order": True,
+                  "order": {"account_number": leaf("6222377", 0.99)},
+                  "line_items": [{"product_description": leaf("Acuvue Oasys", 0.99)}]}
+        with mock.patch.object(s, "call_llm", return_value="{}"), \
+             mock.patch.object(s, "parse_llm_json", return_value=sparse), \
+             mock.patch.object(s, "lookup_oe_code", return_value=("MX9", 0.97, [], True, "ok")), \
+             mock.patch.object(s, "load_prompt", return_value="{sender}{subject}{body}"):
+            s._extract_and_score(order, file_bytes=None)
+        self.assertEqual(order.status, "NEEDS_REVIEW")
+        self.assertIn("incomplete extraction", order.error_message)

@@ -1155,10 +1155,131 @@ def collect_confidences(node, skip_null_fields=True):
 
 def score(fields):
     """Lowest confidence across every POPULATED extracted field. 0.0 if
-    nothing was extracted at all - an empty extraction should never look
-    auto-approvable."""
+    nothing was extracted at all.
+
+    NOT the auto-approval gate - see critical_confidence() for that, and
+    the note there for why min() over EVERY field cannot be one. Kept
+    because it is still the honest "worst field in this extraction" number
+    for diagnostics.
+    """
     confidences = list(collect_confidences(fields))
     return min(confidences) if confidences else 0.0
+
+
+# --- what actually decides whether an order is RIGHT -------------------------
+#
+# min() over EVERY populated field cannot be an approval gate. A real order
+# populates 20-45 leaves; the extraction prompt puts "clearly written free
+# text" at 0.80-0.94, which straddles CONFIDENCE_THRESHOLD (0.85), so each
+# extra field the model fills in makes approval strictly less likely and a
+# complete, correct order is driven to NEEDS_REVIEW by whichever metadata
+# field happened to score lowest - placed_by, order_type, po_date.
+#
+# So the gate looks only at the fields that change what gets SHIPPED and
+# BILLED. Everything else (po_number, customer_address, placed_by, po_date,
+# order_type, special_instructions, diameter, colour) is still extracted,
+# still shown to the reviewer through low_confidence_fields, and still
+# editable - it just cannot on its own send a good order to review.
+
+CRITICAL_EYE_FIELDS = {
+    "order_quantity", "base_curve", "sphere", "cylinder", "axis", "add_power",
+}
+CRITICAL_ITEM_FIELDS = {"product_description", "pack_size"}
+# trial_only is critical because it picks the SKU: product_type 00 (RX stock
+# pack) vs 05 (DX trial pack) are different OE codes for the same lens.
+CRITICAL_ORDER_FIELDS = {"account_number", "trial_only"}
+# only when dtp_order is true - then the parcel ships to the patient and a
+# wrong address is a lost order, not a cosmetic error
+CRITICAL_DTP_FIELDS = {
+    "dtp_patient_name", "dtp_address_line1", "dtp_address_line2",
+    "dtp_city", "dtp_state", "dtp_zip",
+}
+
+
+def iter_leaf_confidences(node, prefix=""):
+    """(dotted_path, confidence) for every POPULATED leaf - the path form
+    collect_low_confidence_paths() and PATCH /fields/ already use."""
+    if isinstance(node, dict):
+        if "confidence" in node and "value" in node:
+            if node.get("value") in (None, ""):
+                return
+            try:
+                yield prefix, float(node.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                yield prefix, 0.0
+            return
+        for key, child in node.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            yield from iter_leaf_confidences(child, path)
+    elif isinstance(node, list):
+        for index, child in enumerate(node):
+            path = f"{prefix}.{index}" if prefix else str(index)
+            yield from iter_leaf_confidences(child, path)
+
+
+def is_critical_path(path, dtp_order=False):
+    """Does this dotted path point at a field that decides what ships?"""
+    parts = path.split(".")
+    leaf = parts[-1]
+
+    if parts[0] == "order":
+        if leaf in CRITICAL_ORDER_FIELDS:
+            return True
+        return bool(dtp_order) and leaf in CRITICAL_DTP_FIELDS
+
+    if parts[0] == "line_items":
+        if leaf in CRITICAL_ITEM_FIELDS:
+            return True
+        # line_items.0.right_eye.sphere -> the parent segment is the eye
+        return len(parts) >= 4 and parts[-2].endswith("_eye") and leaf in CRITICAL_EYE_FIELDS
+
+    return False
+
+
+def critical_confidence(fields):
+    """THE AUTO-APPROVAL GATE: lowest confidence among the fields that
+    decide what gets shipped and billed. 0.0 when none were extracted."""
+    dtp = bool((((fields or {}).get("order") or {}).get("dtp_order") or {}).get("value"))
+    values = [c for path, c in iter_leaf_confidences(fields) if is_critical_path(path, dtp)]
+    return min(values) if values else 0.0
+
+
+def extraction_gaps(fields):
+    """Completeness guard. critical_confidence() only scores the fields that
+    ARE there, so a sparse extraction ("Acuvue Oasys", nothing else) could
+    otherwise score 0.97 on one field and sail through. An order may only
+    auto-approve if it actually says what to send and to whom.
+
+    Returns a list of plain-English gaps; empty means complete.
+    """
+    fields = fields or {}
+    header = fields.get("order") or {}
+    items = fields.get("line_items") or []
+    gaps = []
+
+    def value_of(node, name):
+        return ((node or {}).get(name) or {}).get("value")
+
+    if not value_of(header, "account_number"):
+        gaps.append("no account number")
+    if not items:
+        gaps.append("no line items")
+
+    if not any(value_of(item, "product_description") for item in items):
+        gaps.append("no product description on any line item")
+
+    # at least one eye (or an unspecified-eye stock line) must carry both a
+    # power and a quantity, or there is nothing to actually dispense
+    dispensable = False
+    for item in items:
+        for eye_key in ("right_eye", "left_eye", "unspecified_eye"):
+            eye = (item or {}).get(eye_key) or {}
+            if value_of(eye, "sphere") and value_of(eye, "order_quantity"):
+                dispensable = True
+    if not dispensable:
+        gaps.append("no eye has both a power and a quantity")
+
+    return gaps
 
 
 def collect_low_confidence_paths(node, threshold, prefix=""):
@@ -1256,7 +1377,9 @@ def _extract_and_score(order, file_bytes=None):
         "extraction_notes": result.get("extraction_notes", ""),
     }
     order.extracted_data = fields
-    order.min_confidence = score(fields)
+    # the fields that decide what ships - NOT min() over every field, which
+    # no complete order can ever pass. See critical_confidence().
+    order.min_confidence = critical_confidence(fields)
 
     oe_code, oe_confidence, oe_candidates, oe_matched, oe_reason = lookup_oe_code(fields)
     order.oe_code = oe_code or ""
@@ -1272,11 +1395,17 @@ def _extract_and_score(order, file_bytes=None):
             order.oe_uom = str(candidate["uom"])
             break
 
+    # an incomplete extraction must never auto-approve on the strength of
+    # the few fields it did manage to fill in
+    gaps = extraction_gaps(fields)
     auto_eligible = (
-        order.min_confidence >= settings.CONFIDENCE_THRESHOLD
+        not gaps
+        and order.min_confidence >= settings.CONFIDENCE_THRESHOLD
         and (oe_matched or not settings.REQUIRE_OE_MATCH)
     )
     order.status = "AUTO_APPROVED" if auto_eligible else "NEEDS_REVIEW"
+    if gaps:
+        order.error_message = "incomplete extraction: " + "; ".join(gaps)
 
 
 def ingest_attachment(mail, att, headers):
